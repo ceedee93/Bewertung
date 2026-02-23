@@ -17,6 +17,7 @@ C = dict(pos="#2ecc71", neg="#e74c3c", neut="#95a5a6", blue="#3498db",
 PAL = ["#2ecc71", "#3498db", "#e67e22", "#9b59b6", "#1abc9c",
        "#f39c12", "#e74c3c", "#2980b9", "#27ae60", "#8e44ad"]
 TPL = "plotly_dark"
+PEAK_START, PEAK_END = 8, 20  # Peak: Mo-Fr 08:00-20:00
 
 st.markdown("""<style>
 .block-container{padding-top:1rem}
@@ -32,7 +33,7 @@ textarea{font-family:'Courier New',monospace!important;font-size:12px!important}
 
 _DEF = dict(
     load_df=None, spot_df=None,
-    forward_curves=None,
+    forward_curves=None,  # FIX #4: Dict[name -> {"df":..., "start":..., "end":..., "type":..., "profile":...}]
     deals_df=None,
     bt=None,
     config=dict(
@@ -147,7 +148,7 @@ def parse_product_period(name: str) -> Tuple[Optional[date], Optional[date], str
         y = int(y)
         return y + 2000 if y < 100 else y
 
-    m = re.search(r"(?:CAL|YEAR|Y|JA)-?(\d{2,4})", s)
+    m = re.search(r"(?:CAL|YEAR)-?(\d{2,4})", s)
     if m:
         yr = _yr(m.group(1))
         return date(yr, 1, 1), date(yr, 12, 31), "cal"
@@ -182,13 +183,21 @@ def detect_profile(name: str) -> str:
 
 
 def is_peak_hour(dt) -> bool:
+    """Mo-Fr 08:00-20:00 = Peak."""
     if dt.weekday() >= 5:
         return False
-    return 8 <= dt.hour < 20
+    return PEAK_START <= dt.hour < PEAK_END
+
+
+def peak_hours_in_day(dt) -> float:
+    """Wie viele Peak-Stunden hat dieser Tag?"""
+    if dt.weekday() >= 5:
+        return 0.0
+    return float(PEAK_END - PEAK_START)  # 12h
 
 
 # ═══════════════════════════════════════════════
-# DEAL & FORWARD PARSERS
+# DEAL PARSER
 # ═══════════════════════════════════════════════
 
 def parse_deals(raw_df) -> Optional[pd.DataFrame]:
@@ -223,13 +232,23 @@ def parse_deals(raw_df) -> Optional[pd.DataFrame]:
     if kd:
         r["kaufdatum"] = pd.to_datetime(raw_df[kd], dayfirst=True, errors="coerce")
 
+    # FIX #2: Leistung (MW) UND Menge (MWh) erkennen
     mw_c = next((o for o, l in cols.items()
-                 if any(k in l for k in ("leistung", "power", "kapaz")) or l.strip() == "mw"), None)
+                 if any(k in l for k in ("leistung", "power", "kapaz"))
+                 or (l.strip() == "mw" and "mwh" not in l)), None)
     if mw_c:
         v = raw_df[mw_c]
         if v.dtype == object:
             v = v.astype(str).str.replace(",", ".")
         r["leistung_mw"] = pd.to_numeric(v, errors="coerce")
+
+    mwh_c = next((o for o, l in cols.items()
+                  if any(k in l for k in ("menge", "volume", "energy", "mwh"))), None)
+    if mwh_c:
+        v = raw_df[mwh_c]
+        if v.dtype == object:
+            v = v.astype(str).str.replace(",", ".")
+        r["menge_mwh"] = pd.to_numeric(v, errors="coerce")
 
     p_c = next((o for o, l in cols.items()
                 if any(k in l for k in ("preis", "price", "eur", "€"))), None)
@@ -248,7 +267,13 @@ def parse_deals(raw_df) -> Optional[pd.DataFrame]:
     return r.dropna(subset=["preis"]).reset_index(drop=True)
 
 
-def parse_forward_curves(raw_df) -> Optional[Dict[str, pd.DataFrame]]:
+# ═══════════════════════════════════════════════
+# FORWARD-KURVEN PARSER
+# FIX #4: Metadata als dict, NICHT DataFrame.attrs
+# ═══════════════════════════════════════════════
+
+def parse_forward_curves(raw_df) -> Optional[Dict]:
+    """Returns Dict[name -> {"df": DataFrame, "start": date, "end": date, "type": str, "profile": str}]"""
     if raw_df is None or raw_df.empty:
         return None
     dt_col = find_datetime_col(raw_df)
@@ -274,8 +299,7 @@ def parse_forward_curves(raw_df) -> Optional[Dict[str, pd.DataFrame]]:
             }).dropna().sort_values("datetime").reset_index(drop=True)
             if len(sub) > 0:
                 s, e, pt = parse_product_period(name)
-                sub.attrs.update(lieferstart=s, lieferende=e, produkttyp=pt, profil=detect_profile(name))
-                curves[name] = sub
+                curves[name] = {"df": sub, "start": s, "end": e, "type": pt, "profile": detect_profile(name)}
     else:
         for col in other_cols:
             vals = raw_df[col]
@@ -290,17 +314,44 @@ def parse_forward_curves(raw_df) -> Optional[Dict[str, pd.DataFrame]]:
             if len(sub) > 0:
                 name = str(col).strip()
                 s, e, pt = parse_product_period(name)
-                sub.attrs.update(lieferstart=s, lieferende=e, produkttyp=pt, profil=detect_profile(name))
-                curves[name] = sub
+                curves[name] = {"df": sub, "start": s, "end": e, "type": pt, "profile": detect_profile(name)}
+
     return curves if curves else None
 
 
+def get_curve_df(curves: Dict, name: str) -> pd.DataFrame:
+    """Hilfsfunktion: sicher auf curve["df"] zugreifen."""
+    entry = curves.get(name, {})
+    if isinstance(entry, dict):
+        return entry.get("df", pd.DataFrame())
+    return entry  # Fallback für alte Struktur
+
+
+def get_curve_meta(curves: Dict, name: str, key: str, default=None):
+    """Hilfsfunktion: sicher auf curve-Metadaten zugreifen."""
+    entry = curves.get(name, {})
+    if isinstance(entry, dict):
+        return entry.get(key, default)
+    return default
+
+
 # ═══════════════════════════════════════════════
-# BEWERTUNGS-ENGINE (periodengenau)
+# BEWERTUNGS-ENGINE – KORRIGIERT
 # ═══════════════════════════════════════════════
 
-def compute_delivery_profile(deals: pd.DataFrame, load_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def compute_delivery_profile(
+    deals: pd.DataFrame, load_df: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """Periodengenau: Terminlieferung pro Deal, Restlast, Überdeckung.
+
+    FIX #2: Unterstützt sowohl leistung_mw als auch menge_mwh.
+    FIX #3: Peak-Produkte korrekt bei täglicher Granularität.
+    FIX #10: Warnung bei Produktüberlappung.
+
+    Returns: (profile_df, deal_details_df, warnings_list)
+    """
     result = load_df[["datetime", "load_mwh"]].copy().sort_values("datetime").reset_index(drop=True)
+    warnings = []
 
     if len(result) > 1:
         h_per_period = max(result.datetime.diff().dropna().median().total_seconds() / 3600, 0.25)
@@ -308,34 +359,107 @@ def compute_delivery_profile(deals: pd.DataFrame, load_df: pd.DataFrame) -> Tupl
         h_per_period = 24.0
 
     is_hourly = h_per_period <= 1.5
+    is_daily = 20 <= h_per_period <= 28
+
     result["termin_mwh"] = 0.0
     result["termin_cost"] = 0.0
 
     deal_details = []
+    active_products = []  # FIX #10: Track overlapping products
+
     for idx, deal in deals.iterrows():
         if pd.isna(deal.get("lieferstart")) or pd.isna(deal.get("lieferende")):
             continue
-        if pd.isna(deal.get("preis")) or pd.isna(deal.get("leistung_mw")):
+        if pd.isna(deal.get("preis")):
             continue
 
-        mask = (result.datetime >= deal.lieferstart) & (result.datetime <= deal.lieferende)
-        if is_hourly and deal.get("profil", "Base") == "Peak":
-            mask = mask & result.datetime.apply(is_peak_hour)
+        ls, le = deal.lieferstart, deal.lieferende
+        price = deal.preis
+        profil = deal.get("profil", "Base")
 
-        mwh_p = deal.leistung_mw * h_per_period
-        n_p = int(mask.sum())
-        result.loc[mask, "termin_mwh"] += mwh_p
-        result.loc[mask, "termin_cost"] += mwh_p * deal.preis
+        # FIX #2: Leistung ODER Menge verwenden
+        has_mw = "leistung_mw" in deal.index and pd.notna(deal.get("leistung_mw"))
+        has_mwh = "menge_mwh" in deal.index and pd.notna(deal.get("menge_mwh"))
+
+        if not has_mw and not has_mwh:
+            warnings.append(f"⚠️ Deal '{deal.get('produkt', idx)}': Weder MW noch MWh angegeben – übersprungen.")
+            continue
+
+        mask = (result.datetime >= ls) & (result.datetime <= le)
+        n_periods = int(mask.sum())
+        if n_periods == 0:
+            warnings.append(f"⚠️ Deal '{deal.get('produkt', idx)}': Kein Überlapp mit Lastdaten.")
+            continue
+
+        # FIX #3: Peak/Base korrekt für alle Granularitäten
+        if profil == "Peak":
+            if is_hourly:
+                peak_mask = result.datetime.apply(is_peak_hour)
+                mask = mask & peak_mask
+                mwh_per_period = deal.leistung_mw * h_per_period if has_mw else None
+            elif is_daily:
+                # Tägliche Daten: Peak-Stunden pro Tag berechnen
+                peak_hours = result.datetime.apply(peak_hours_in_day)
+                # Nur Wochentage liefern
+                weekday_mask = result.datetime.dt.weekday < 5
+                mask = mask & weekday_mask
+                if has_mw:
+                    mwh_per_period = None  # wird pro Tag berechnet
+                    # MW × Peak-Stunden des jeweiligen Tages
+                    mwh_series = deal.leistung_mw * peak_hours
+                else:
+                    mwh_per_period = None
+            else:
+                mwh_per_period = deal.leistung_mw * h_per_period if has_mw else None
+        else:
+            # Base: alle Perioden, volle Stunden
+            mwh_per_period = deal.leistung_mw * h_per_period if has_mw else None
+
+        n_delivery = int(mask.sum())
+        if n_delivery == 0:
+            continue
+
+        # Liefermengen berechnen
+        if profil == "Peak" and is_daily and has_mw:
+            # Spezialfall: tägliche Peak-Lieferung variiert
+            delivery = deal.leistung_mw * peak_hours
+            result.loc[mask, "termin_mwh"] += delivery[mask].values
+            result.loc[mask, "termin_cost"] += (delivery[mask] * price).values
+            total_mwh = float(delivery[mask].sum())
+        elif has_mw:
+            result.loc[mask, "termin_mwh"] += mwh_per_period
+            result.loc[mask, "termin_cost"] += mwh_per_period * price
+            total_mwh = mwh_per_period * n_delivery
+        else:
+            # FIX #2: menge_mwh gleichmäßig verteilen
+            mwh_per_period_calc = deal.menge_mwh / n_delivery
+            result.loc[mask, "termin_mwh"] += mwh_per_period_calc
+            result.loc[mask, "termin_cost"] += mwh_per_period_calc * price
+            total_mwh = deal.menge_mwh
+
+        # FIX #10: Überlappung prüfen
+        deal_range = (ls, le, profil)
+        for prev_name, prev_start, prev_end, prev_prof in active_products:
+            if prev_prof == profil and max(ls, prev_start) <= min(le, prev_end):
+                overlap_start = max(ls, prev_start).strftime("%d.%m.%Y")
+                overlap_end = min(le, prev_end).strftime("%d.%m.%Y")
+                warnings.append(
+                    f"ℹ️ Stacking: '{deal.get('produkt', idx)}' + '{prev_name}' "
+                    f"überlappen {overlap_start}–{overlap_end} ({profil}). "
+                    f"Leistungen addieren sich."
+                )
+        active_products.append((deal.get("produkt", f"Deal {idx}"), ls, le, profil))
 
         deal_details.append({
             "produkt": deal.get("produkt", f"Deal {idx}"),
-            "lieferstart": deal.lieferstart, "lieferende": deal.lieferende,
-            "leistung_mw": deal.leistung_mw, "preis": deal.preis,
-            "profil": deal.get("profil", "Base"),
-            "perioden": n_p, "mwh_geliefert": mwh_p * n_p,
-            "kosten": mwh_p * n_p * deal.preis,
+            "lieferstart": ls, "lieferende": le,
+            "leistung_mw": deal.get("leistung_mw", np.nan),
+            "menge_mwh": total_mwh,
+            "preis": price, "profil": profil,
+            "perioden": n_delivery, "kosten": total_mwh * price,
         })
 
+    # Effektive Lieferung begrenzt auf Last
     result["termin_eff_mwh"] = result[["termin_mwh", "load_mwh"]].min(axis=1)
     result["überdeckung_mwh"] = (result.termin_mwh - result.load_mwh).clip(lower=0)
     result["restlast_mwh"] = (result.load_mwh - result.termin_eff_mwh).clip(lower=0)
@@ -343,20 +467,59 @@ def compute_delivery_profile(deals: pd.DataFrame, load_df: pd.DataFrame) -> Tupl
     ratio = np.where(result.termin_mwh > 0, result.termin_eff_mwh / result.termin_mwh, 0)
     result["termin_eff_cost"] = result.termin_cost * ratio
 
-    return result, pd.DataFrame(deal_details) if deal_details else pd.DataFrame()
+    return result, pd.DataFrame(deal_details) if deal_details else pd.DataFrame(), warnings
 
 
-def evaluate_strategy(load_df, spot_df, deals, name="Strategie") -> Dict:
-    profile, deal_det = compute_delivery_profile(deals, load_df)
+def merge_profile_with_spot(profile: pd.DataFrame, spot_df: pd.DataFrame) -> pd.DataFrame:
+    """FIX #6: Robuster Spot-Merge mit klarer Fallback-Logik.
 
-    merged = pd.merge(profile, spot_df[["datetime", "spot_price"]], on="datetime", how="left")
-    if merged.spot_price.isna().mean() > 0.5:
-        profile["_date"] = profile.datetime.dt.date
-        sd = spot_df.assign(_date=spot_df.datetime.dt.date).groupby("_date").agg(
-            spot_price=("spot_price", "mean")).reset_index()
-        merged = pd.merge(profile, sd, on="_date", how="left").drop(columns=["_date"], errors="ignore")
+    1. Exakter Datetime-Match
+    2. Falls <10% Match: täglicher Fallback
+    3. Forward-fill für vereinzelte Lücken
+    """
+    merged = pd.merge(profile, spot_df[["datetime", "spot_price"]],
+                       on="datetime", how="left")
+    match_rate = merged.spot_price.notna().mean()
 
-    merged["spot_price"] = merged["spot_price"].ffill().bfill()
+    if match_rate < 0.1:
+        # Fast keine Matches → täglicher Fallback
+        prof_daily = profile.copy()
+        prof_daily["_merge_date"] = prof_daily.datetime.dt.date
+        spot_daily = (spot_df.assign(_merge_date=spot_df.datetime.dt.date)
+                      .groupby("_merge_date")
+                      .agg(spot_price=("spot_price", "mean"))
+                      .reset_index())
+        merged = pd.merge(prof_daily, spot_daily, on="_merge_date", how="left")
+        merged = merged.drop(columns=["_merge_date"])
+        match_rate = merged.spot_price.notna().mean()
+
+    # Lücken füllen
+    if merged.spot_price.isna().any():
+        n_gaps = int(merged.spot_price.isna().sum())
+        merged["spot_price"] = merged["spot_price"].ffill().bfill()
+
+    return merged
+
+
+def evaluate_strategy(
+    load_df: pd.DataFrame,
+    spot_df: pd.DataFrame,
+    deals: pd.DataFrame,
+    name: str = "Strategie",
+    tx_cost: float = 0.0,  # FIX #1: TX-Kosten als Parameter
+) -> Dict:
+    """Bewertet eine Strategie periodengenau.
+
+    FIX #1: TX-Kosten werden auf Terminvolumen angewendet.
+    FIX #6: Verbesserter Spot-Merge.
+    """
+    profile, deal_det, warnings = compute_delivery_profile(deals, load_df)
+    merged = merge_profile_with_spot(profile, spot_df)
+
+    if merged.spot_price.isna().any():
+        warnings.append("⚠️ Spotpreise für einige Perioden nicht verfügbar – aufgefüllt.")
+
+    # Kosten berechnen
     merged["spot_cost"] = merged.restlast_mwh * merged.spot_price
     merged["über_erlös"] = merged.überdeckung_mwh * merged.spot_price
 
@@ -367,9 +530,15 @@ def evaluate_strategy(load_df, spot_df, deals, name="Strategie") -> Dict:
     sc = float(merged.spot_cost.sum())
     uv = float(merged.überdeckung_mwh.sum())
     ue = float(merged.über_erlös.sum())
-    tc = tc_term + sc - ue
 
-    ts = float((merged.load_mwh * merged.spot_price).sum())
+    # FIX #1: TX-Kosten auf Terminvolumen
+    tx_total = tv * tx_cost
+
+    tc = tc_term + sc - ue + tx_total
+
+    # Benchmark
+    merged["full_spot_cost"] = merged.load_mwh * merged.spot_price
+    ts = float(merged.full_spot_cost.sum())
     avg_s = ts / td if td else 0
     avg_p = tc / td if td else 0
     pnl = ts - tc
@@ -378,54 +547,62 @@ def evaluate_strategy(load_df, spot_df, deals, name="Strategie") -> Dict:
     at = tc_term / tv if tv > 0 else 0
 
     merged["period_cost"] = merged.termin_eff_cost + merged.spot_cost - merged.über_erlös
+    # TX anteilig auf Perioden mit Terminlieferung verteilen
+    if tv > 0:
+        merged["period_cost"] += merged.termin_eff_mwh * tx_cost
     merged["cum_cost"] = merged.period_cost.cumsum()
-    merged["cum_spot_only"] = (merged.load_mwh * merged.spot_price).cumsum()
+    merged["cum_spot_only"] = merged.full_spot_cost.cumsum()
 
     return dict(
         name=name, total_demand=td,
         termin_vol=tv, termin_cost=tc_term, termin_pct=tp, avg_termin=at,
         spot_vol=sv, spot_cost=sc, avg_spot=avg_s,
-        über_vol=uv, über_erlös=ue,
+        über_vol=uv, über_erlös=ue, tx_cost=tx_total,
         total_cost=tc, avg_price=avg_p, total_spot_cost=ts,
         pnl=pnl, pct=pct, merged=merged, deal_details=deal_det,
+        warnings=warnings,
     )
 
 
-def scale_deals(deals, factor):
+def scale_deals(deals: pd.DataFrame, factor: float) -> pd.DataFrame:
     s = deals.copy()
     if "leistung_mw" in s.columns:
         s["leistung_mw"] = s["leistung_mw"] * factor
+    if "menge_mwh" in s.columns:
+        s["menge_mwh"] = s["menge_mwh"] * factor
     return s
 
 
-def build_sim_deals(forward_curves, products, base_mw, buy_date_idx):
+def build_sim_deals(forward_curves: Dict, products: List[str], base_mw: float, buy_date_idx: int) -> pd.DataFrame:
     rows = []
     for pn in products:
-        if pn not in forward_curves:
+        curve_entry = forward_curves.get(pn)
+        if curve_entry is None:
             continue
-        cv = forward_curves[pn]
-        s = cv.attrs.get("lieferstart")
-        e = cv.attrs.get("lieferende")
-        prof = cv.attrs.get("profil", "Base")
+        cdf = curve_entry["df"]
+        s = curve_entry.get("start")
+        e = curve_entry.get("end")
+        prof = curve_entry.get("profile", "Base")
         if s is None or e is None:
             continue
-        ai = min(buy_date_idx, len(cv) - 1)
+        ai = min(buy_date_idx, len(cdf) - 1)
         rows.append({
-            "produkt": pn, "kaufdatum": cv.iloc[ai]["datetime"],
+            "produkt": pn, "kaufdatum": cdf.iloc[ai]["datetime"],
             "lieferstart": pd.Timestamp(s), "lieferende": pd.Timestamp(e),
-            "leistung_mw": base_mw, "preis": cv.iloc[ai]["price"], "profil": prof,
+            "leistung_mw": base_mw, "preis": float(cdf.iloc[ai]["price"]), "profil": prof,
         })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def run_dca_sim(load_df, spot_df, forward_curves, products, freq, window_months):
+def run_dca_sim(load_df, forward_curves, products, freq, window_months):
     ds = load_df.datetime.min()
     results = []
     for pn in products:
-        if pn not in forward_curves:
+        entry = forward_curves.get(pn)
+        if entry is None:
             continue
-        cv = forward_curves[pn]
-        fb = cv[cv.datetime < ds].copy()
+        cdf = entry["df"]
+        fb = cdf[cdf.datetime < ds].copy()
         if window_months > 0:
             fb = fb[fb.datetime >= ds - pd.DateOffset(months=window_months)]
         if freq == "Wöchentlich":
@@ -435,83 +612,140 @@ def run_dca_sim(load_df, spot_df, forward_curves, products, freq, window_months)
         if not fb.empty:
             results.append(dict(
                 produkt=pn, n_käufe=len(fb), avg_preis=float(fb.price.mean()),
-                min_preis=float(fb.price.min()), max_preis=float(fb.price.max()), kaufdaten=fb,
+                min_preis=float(fb.price.min()), max_preis=float(fb.price.max()),
             ))
     return results
 
 
+def validate_forward_timing(forward_curves: Dict, delivery_start) -> List[str]:
+    """FIX #7: Prüft ob Forward-Daten vor Lieferperiode liegen."""
+    warnings = []
+    for name, entry in forward_curves.items():
+        cdf = entry["df"]
+        fwd_end = cdf.datetime.max()
+        if fwd_end >= delivery_start:
+            n_after = int((cdf.datetime >= delivery_start).sum())
+            warnings.append(
+                f"ℹ️ '{name}': {n_after} Forward-Datenpunkte liegen NACH Lieferbeginn "
+                f"({delivery_start.date()}) – nur Daten davor werden verwendet."
+            )
+        fwd_start = cdf.datetime.min()
+        n_before = int((cdf.datetime < delivery_start).sum())
+        if n_before == 0:
+            warnings.append(f"⚠️ '{name}': KEINE Daten vor Lieferbeginn!")
+        elif n_before < 20:
+            warnings.append(f"⚠️ '{name}': Nur {n_before} Datenpunkte vor Lieferbeginn.")
+    return warnings
+
+
 def run_full_backtest(load_df, spot_df, forward_curves, deals_df, config, progress=None):
-    results = []
-    total_spot_cost = None
+    """FIX #1: TX-Kosten durchgereicht.
+    FIX #5: Progress-Bar korrekt berechnet.
+    FIX #7: Forward-Timing validiert.
+    """
+    tx = config.get("tx_cost", 0.0)
+    all_warnings = []
 
-    # Benchmark: 100% Spot
+    # FIX #7: Validierung
+    if forward_curves:
+        all_warnings.extend(validate_forward_timing(forward_curves, load_df.datetime.min()))
+
+    # Benchmark
     empty = pd.DataFrame(columns=["produkt", "lieferstart", "lieferende", "leistung_mw", "preis", "profil"])
-    bench = evaluate_strategy(load_df, spot_df, empty, "100% Spot")
-    total_spot_cost = bench["total_spot_cost"]
-    # Don't add benchmark to results – it's the reference
+    bench = evaluate_strategy(load_df, spot_df, empty, "100% Spot", tx_cost=0)
 
+    results = []
     done = 0
-    total_steps = 1  # estimate
 
-    # Echte Deals
+    # FIX #5: Korrekte Gesamtanzahl berechnen
+    n_deal_scenarios = 0
+    n_sim_scenarios = 0
+    n_dca_scenarios = 0
+
+    sim_shares = config.get("sim_shares", [1.0])
+
     if deals_df is not None and not deals_df.empty:
-        r = evaluate_strategy(load_df, spot_df, deals_df, "📝 Echte Deals")
-        results.append(r)
+        n_deal_scenarios = 1 + len([f for f in sim_shares if f != 1.0])
 
-        # Skalierte Deals
-        for factor in config.get("sim_shares", []):
+    if forward_curves:
+        products = config.get("sim_products", list(forward_curves.keys()))
+        products = [p for p in products if p in forward_curves]
+        if products:
+            n_sim_scenarios = len(sim_shares) * 5  # 5 buy timings
+            n_dca_scenarios = len(sim_shares)
+
+    total_steps = max(n_deal_scenarios + n_sim_scenarios + n_dca_scenarios, 1)
+
+    def _progress(label=""):
+        nonlocal done
+        done += 1
+        if progress:
+            progress.progress(min(done / total_steps, 0.99), f"{done}/{total_steps} {label}")
+
+    # ── Echte Deals ──
+    if deals_df is not None and not deals_df.empty:
+        r = evaluate_strategy(load_df, spot_df, deals_df, "📝 Echte Deals", tx_cost=tx)
+        results.append(r)
+        all_warnings.extend(r.get("warnings", []))
+        _progress("Echte Deals")
+
+        for factor in sim_shares:
             if factor == 1.0:
                 continue
             scaled = scale_deals(deals_df, factor)
-            r = evaluate_strategy(load_df, spot_df, scaled, f"Deals ×{factor:.1f}")
+            r = evaluate_strategy(load_df, spot_df, scaled, f"Deals ×{factor:.1f}", tx_cost=tx)
             results.append(r)
-        done += 1
+            _progress(f"Deals ×{factor:.1f}")
 
-    # Simulation aus Forward-Kurven
+    # ── Simulation aus Forward-Kurven ──
     if forward_curves:
         products = config.get("sim_products", list(forward_curves.keys()))
         products = [p for p in products if p in forward_curves]
 
         if products:
-            first_curve = forward_curves[products[0]]
+            # Kaufzeitpunkte basierend auf erster Kurve
+            first_entry = forward_curves[products[0]]
             ds = load_df.datetime.min()
-            fb = first_curve[first_curve.datetime < ds]
+            fb = first_entry["df"][first_entry["df"].datetime < ds]
             n_dates = len(fb)
 
             if n_dates > 0:
                 buy_idxs = [0, n_dates // 4, n_dates // 2, 3 * n_dates // 4, n_dates - 1]
                 buy_labels = ["Früh", "25%", "Mitte", "75%", "Spät"]
 
-                for mw in config.get("sim_shares", [1.0]):
+                for mw in sim_shares:
                     for bi, bl in zip(buy_idxs, buy_labels):
                         sim = build_sim_deals(forward_curves, products, mw, bi)
                         if not sim.empty:
-                            r = evaluate_strategy(load_df, spot_df, sim, f"Sim {mw:.1f}MW {bl}")
+                            r = evaluate_strategy(load_df, spot_df, sim,
+                                                  f"Sim {mw:.1f}MW {bl}", tx_cost=tx)
                             results.append(r)
-                        done += 1
-                        if progress:
-                            progress.progress(min(done / max(len(buy_idxs) * len(config.get("sim_shares", [1])), 1), 0.95))
+                        _progress(f"Sim {mw:.1f}MW {bl}")
 
                 # DCA
-                dca_r = run_dca_sim(load_df, spot_df, forward_curves, products,
-                                    config.get("dca_freq", "Täglich"), config.get("dca_window_months", 0))
+                dca_r = run_dca_sim(load_df, forward_curves, products,
+                                    config.get("dca_freq", "Täglich"),
+                                    config.get("dca_window_months", 0))
                 if dca_r:
                     dca_deals_list = []
                     for dr in dca_r:
-                        cv = forward_curves[dr["produkt"]]
+                        entry = forward_curves[dr["produkt"]]
                         dca_deals_list.append({
                             "produkt": f"DCA-{dr['produkt']}",
-                            "lieferstart": pd.Timestamp(cv.attrs.get("lieferstart")),
-                            "lieferende": pd.Timestamp(cv.attrs.get("lieferende")),
-                            "leistung_mw": 1.0, "preis": dr["avg_preis"],
-                            "profil": cv.attrs.get("profil", "Base"),
+                            "lieferstart": pd.Timestamp(entry["start"]),
+                            "lieferende": pd.Timestamp(entry["end"]),
+                            "leistung_mw": 1.0,
+                            "preis": dr["avg_preis"],
+                            "profil": entry.get("profile", "Base"),
                         })
                     if dca_deals_list:
                         dca_df = pd.DataFrame(dca_deals_list)
-                        for factor in config.get("sim_shares", [1.0]):
+                        for factor in sim_shares:
                             sc = scale_deals(dca_df, factor)
-                            r = evaluate_strategy(load_df, spot_df, sc, f"DCA {factor:.1f}MW")
+                            r = evaluate_strategy(load_df, spot_df, sc,
+                                                  f"DCA {factor:.1f}MW", tx_cost=tx)
                             results.append(r)
+                            _progress(f"DCA {factor:.1f}MW")
 
     # Ergebnis-Tabelle
     rows = []
@@ -527,6 +761,7 @@ def run_full_backtest(load_df, spot_df, forward_curves, deals_df, config, progre
             "Spotvol. [MWh]": r["spot_vol"],
             "Ø Spot [€/MWh]": r["avg_spot"],
             "Spotkosten [€]": r["spot_cost"],
+            "TX-Kosten [€]": r.get("tx_cost", 0),
             "Überdeckung [MWh]": r["über_vol"],
             "Über-Erlös [€]": r["über_erlös"],
             "Gesamt [€]": r["total_cost"],
@@ -541,16 +776,17 @@ def run_full_backtest(load_df, spot_df, forward_curves, deals_df, config, progre
 
     return dict(
         results=rdf, merged=bench["merged"],
-        total_spot=total_spot_cost,
+        total_spot=bench["total_spot_cost"],
         demand=float(load_df.load_mwh.sum()),
         avg_spot=bench["avg_spot"],
         cum=cum_data,
         details={r["name"]: r for r in results},
+        warnings=all_warnings,
     )
 
 
 # ═══════════════════════════════════════════════
-# DEMO DATA
+# DEMO – FIX #8: Realistische Dimensionierung
 # ═══════════════════════════════════════════════
 
 def generate_demo():
@@ -558,32 +794,29 @@ def generate_demo():
     d25 = pd.date_range("2025-01-01", "2025-12-31", freq="D")
     n = len(d25)
     s = 20 * np.sin(np.linspace(0, 2 * np.pi, n))
+
+    # ~100 MWh/Tag ≈ 4.2 MW Grundlast
     ld = pd.DataFrame({"datetime": d25, "load_mwh": np.maximum(100 + s + rng.normal(0, 8, n), 20)})
     sd = pd.DataFrame({"datetime": d25, "spot_price": np.maximum(75 + s * .75 + rng.normal(0, 12, n), 5)})
 
     d24 = pd.bdate_range("2024-01-02", "2024-12-30")[:250]
-    base = 82 + np.cumsum(rng.normal(-.02, .8, len(d24)))
+    base_fwd = 82 + np.cumsum(rng.normal(-.02, .8, len(d24)))
 
+    # FIX #8: Realistische MW-Werte (Last ≈ 4 MW, Deals < 4 MW)
     curves = {}
-    for name, sd_s, ed_s, off in [
-        ("Cal-25 Base", "2025-01-01", "2025-12-31", 0),
-        ("Q1-25 Base", "2025-01-01", "2025-03-31", 3),
-        ("Q2-25 Base", "2025-04-01", "2025-06-30", -2),
-        ("Q3-25 Base", "2025-07-01", "2025-09-30", -5),
-        ("Q4-25 Base", "2025-10-01", "2025-12-31", 2),
-    ]:
-        prices = np.maximum(base + off + rng.normal(0, 1, len(d24)), 40)
+    for name, off in [("Cal-25 Base", 0), ("Q1-25 Base", 3), ("Q2-25 Base", -2),
+                       ("Q3-25 Base", -5), ("Q4-25 Base", 2)]:
+        prices = np.maximum(base_fwd + off + rng.normal(0, 1, len(d24)), 40)
         df = pd.DataFrame({"datetime": d24, "price": prices})
-        sp, ep, pt = parse_product_period(name)
-        df.attrs.update(lieferstart=sp, lieferende=ep, produkttyp=pt, profil=detect_profile(name))
-        curves[name] = df
+        s_d, e_d, pt = parse_product_period(name)
+        curves[name] = {"df": df, "start": s_d, "end": e_d, "type": pt, "profile": "Base"}
 
     deals = pd.DataFrame({
         "produkt": ["Cal-25 Base", "Q1-25 Base", "Q3-25 Base"],
         "kaufdatum": pd.to_datetime(["2024-03-15", "2024-06-01", "2024-09-10"]),
         "lieferstart": pd.to_datetime(["2025-01-01", "2025-01-01", "2025-07-01"]),
         "lieferende": pd.to_datetime(["2025-12-31", "2025-03-31", "2025-09-30"]),
-        "leistung_mw": [10.0, 5.0, 3.0],
+        "leistung_mw": [2.0, 0.5, 0.3],  # FIX #8: realistisch
         "preis": [82.50, 85.00, 78.20],
         "profil": ["Base", "Base", "Base"],
     })
@@ -591,14 +824,14 @@ def generate_demo():
 
 
 # ═══════════════════════════════════════════════
-# CHART FUNCTIONS – each returns unique figure
+# CHARTS
 # ═══════════════════════════════════════════════
 
 def _pc(v):
     return [C["pos"] if x > 0 else C["neg"] if x < 0 else C["neut"] for x in v]
 
 
-def fig_costs(df, ref, title_suffix=""):
+def fig_costs(df, ref, suffix=""):
     fig = go.Figure(go.Bar(
         x=df.Strategie, y=df["Gesamt [€]"],
         marker_color=_pc(df["PnL vs Spot [€]"]),
@@ -606,81 +839,71 @@ def fig_costs(df, ref, title_suffix=""):
         textposition="outside", textfont_size=9))
     fig.add_hline(y=ref, line_dash="dash", line_color="red",
                   annotation_text=f"100% Spot: {ref:,.0f}€")
-    fig.update_layout(title=f"Gesamtkosten{title_suffix}", xaxis_tickangle=-45,
-                      height=500, template=TPL)
+    fig.update_layout(title=f"Gesamtkosten{suffix}", xaxis_tickangle=-45, height=500, template=TPL)
     return fig
 
 
-def fig_savings(df, title_suffix=""):
+def fig_savings(df, suffix=""):
     fig = go.Figure(go.Bar(
         x=df.Strategie, y=df["PnL vs Spot [€]"],
         marker_color=_pc(df["PnL vs Spot [€]"]),
         text=df["PnL vs Spot [€]"].apply(lambda v: f"{v:+,.0f}€"),
         textposition="outside", textfont_size=9))
     fig.add_hline(y=0, line_color="white")
-    fig.update_layout(title=f"Ersparnis vs. Spot{title_suffix}", xaxis_tickangle=-45,
-                      height=450, template=TPL)
+    fig.update_layout(title=f"Ersparnis vs. Spot{suffix}", xaxis_tickangle=-45, height=450, template=TPL)
     return fig
 
 
-def fig_cum(merged, cum, keys, title_suffix=""):
+def fig_cum(merged, cum, keys, suffix=""):
     fig = go.Figure()
     if "cum_spot_only" in merged.columns:
-        fig.add_trace(go.Scatter(
-            x=merged.datetime, y=merged.cum_spot_only, mode="lines",
-            name="100% Spot", line=dict(color="red", width=3, dash="dash")))
+        fig.add_trace(go.Scatter(x=merged.datetime, y=merged.cum_spot_only, mode="lines",
+                                 name="100% Spot", line=dict(color="red", width=3, dash="dash")))
     for i, k in enumerate(keys):
         if k in cum:
-            fig.add_trace(go.Scatter(
-                x=merged.datetime, y=cum[k], mode="lines",
-                name=k, line=dict(color=PAL[i % len(PAL)], width=2)))
-    fig.update_layout(title=f"Kumulative Kosten{title_suffix}",
-                      height=500, template=TPL, legend=dict(font_size=9))
+            fig.add_trace(go.Scatter(x=merged.datetime, y=cum[k], mode="lines",
+                                     name=k, line=dict(color=PAL[i % len(PAL)], width=2)))
+    fig.update_layout(title=f"Kumulative Kosten{suffix}", height=500, template=TPL,
+                      legend=dict(font_size=9))
     return fig
 
 
-def fig_delivery_profile(merged, title_suffix=""):
+def fig_delivery(merged, suffix=""):
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=merged.datetime, y=merged.load_mwh, mode="lines",
-        name="Last [MWh]", line=dict(color=C["blue"], width=1.5)))
-    fig.add_trace(go.Scatter(
-        x=merged.datetime, y=merged.termin_eff_mwh, mode="lines",
-        name="Terminlieferung", fill="tozeroy",
-        fillcolor="rgba(46,204,113,0.3)", line=dict(color=C["pos"], width=1)))
-    fig.add_trace(go.Scatter(
-        x=merged.datetime, y=merged.restlast_mwh, mode="lines",
-        name="Restlast → Spot", line=dict(color=C["orange"], width=1, dash="dot")))
+    fig.add_trace(go.Scatter(x=merged.datetime, y=merged.load_mwh, mode="lines",
+                             name="Last [MWh]", line=dict(color=C["blue"], width=1.5)))
+    fig.add_trace(go.Scatter(x=merged.datetime, y=merged.termin_eff_mwh, mode="lines",
+                             name="Terminlieferung", fill="tozeroy",
+                             fillcolor="rgba(46,204,113,0.3)", line=dict(color=C["pos"], width=1)))
+    fig.add_trace(go.Scatter(x=merged.datetime, y=merged.restlast_mwh, mode="lines",
+                             name="Restlast → Spot", line=dict(color=C["orange"], width=1, dash="dot")))
     if (merged.überdeckung_mwh > 0).any():
-        fig.add_trace(go.Scatter(
-            x=merged.datetime, y=merged.überdeckung_mwh, mode="lines",
-            name="Überdeckung", line=dict(color=C["neg"], width=1, dash="dash")))
-    fig.update_layout(title=f"Lieferprofil{title_suffix}", height=450, template=TPL)
+        fig.add_trace(go.Scatter(x=merged.datetime, y=merged.überdeckung_mwh, mode="lines",
+                                 name="Überdeckung", line=dict(color=C["neg"], width=1, dash="dash")))
+    fig.update_layout(title=f"Lieferprofil{suffix}", height=450, template=TPL)
     return fig
 
 
-def fig_forward_curves(curves, deals_df=None, title_suffix=""):
+def fig_forward_curves(curves, deals_df=None, suffix=""):
     fig = go.Figure()
-    for i, (name, cv) in enumerate(curves.items()):
-        fig.add_trace(go.Scatter(
-            x=cv.datetime, y=cv.price, mode="lines",
-            name=name, line=dict(color=PAL[i % len(PAL)], width=2)))
+    for i, (name, entry) in enumerate(curves.items()):
+        cdf = entry["df"]
+        fig.add_trace(go.Scatter(x=cdf.datetime, y=cdf.price, mode="lines",
+                                 name=name, line=dict(color=PAL[i % len(PAL)], width=2)))
     if deals_df is not None and "kaufdatum" in deals_df.columns:
         for _, d in deals_df.iterrows():
             if pd.notna(d.get("kaufdatum")) and pd.notna(d.get("preis")):
                 fig.add_trace(go.Scatter(
                     x=[d.kaufdatum], y=[d.preis], mode="markers+text",
-                    name=d.get("produkt", "Deal"),
                     marker=dict(color=C["gold"], size=12, symbol="star"),
                     text=[d.get("produkt", "")], textposition="top center",
                     textfont=dict(size=9), showlegend=False))
-    fig.update_layout(title=f"Forward-Kurven{title_suffix}",
-                      height=450, template=TPL, yaxis_title="€/MWh")
+    fig.update_layout(title=f"Forward-Kurven{suffix}", height=450, template=TPL, yaxis_title="€/MWh")
     return fig
 
 
 # ═══════════════════════════════════════════════
-# UI COMPONENT: DATA INPUT
+# UI COMPONENT
 # ═══════════════════════════════════════════════
 
 def data_input(title, key, state_key, val_label, val_name, placeholder, unit=""):
@@ -689,20 +912,15 @@ def data_input(title, key, state_key, val_label, val_name, placeholder, unit="")
         if st.session_state[state_key] is not None:
             df = st.session_state[state_key]
             c1, c2 = st.columns([5, 1])
-            c1.success(
-                f"✅ **{len(df)}** Eintr. · "
-                f"{df.datetime.min().date()} → {df.datetime.max().date()} · "
-                f"Ø {df[val_name].mean():.1f} {unit}")
+            c1.success(f"✅ **{len(df)}** Eintr. · {df.datetime.min().date()} → {df.datetime.max().date()} · Ø {df[val_name].mean():.1f} {unit}")
             if c2.button("🗑️", key=f"{key}_del"):
                 st.session_state[state_key] = None
                 st.session_state.pop(f"{key}_raw", None)
                 st.rerun()
             return
-
         tp, tf = st.tabs(["📋 Einfügen", "📁 Datei"])
         with tp:
-            txt = st.text_area("Daten einfügen", height=140, key=f"{key}_txt",
-                               placeholder=placeholder)
+            txt = st.text_area("Daten einfügen", height=140, key=f"{key}_txt", placeholder=placeholder)
             if st.button("🔄 Verarbeiten", key=f"{key}_go", type="primary",
                          use_container_width=True, disabled=not txt):
                 raw = parse_text(txt)
@@ -712,14 +930,12 @@ def data_input(title, key, state_key, val_label, val_name, placeholder, unit="")
                 else:
                     st.error("❌ Mind. 2 Spalten nötig")
         with tf:
-            f = st.file_uploader("Datei wählen", ["csv", "xlsx", "xls"],
-                                 key=f"{key}_f", label_visibility="collapsed")
+            f = st.file_uploader("Datei", ["csv", "xlsx", "xls"], key=f"{key}_f", label_visibility="collapsed")
             if f and st.button("📁 Laden", key=f"{key}_fl", use_container_width=True):
                 raw = load_file(f)
                 if raw is not None:
                     st.session_state[f"{key}_raw"] = raw
                     st.rerun()
-
         raw = st.session_state.get(f"{key}_raw")
         if raw is not None and len(raw) > 0:
             st.divider()
@@ -728,11 +944,8 @@ def data_input(title, key, state_key, val_label, val_name, placeholder, unit="")
             at = find_datetime_col(raw)
             av = find_value_col(raw, at)
             c1, c2, c3 = st.columns([2, 2, 1])
-            tc = c1.selectbox("📅 Datum", cols,
-                              index=cols.index(at) if at in cols else 0, key=f"{key}_tc")
-            vc = c2.selectbox(f"📊 {val_label}", cols,
-                              index=cols.index(av) if av in cols else min(1, len(cols) - 1),
-                              key=f"{key}_vc")
+            tc = c1.selectbox("📅", cols, index=cols.index(at) if at in cols else 0, key=f"{key}_tc")
+            vc = c2.selectbox(f"📊 {val_label}", cols, index=cols.index(av) if av in cols else min(1, len(cols) - 1), key=f"{key}_vc")
             if c3.button("✅", key=f"{key}_ok", type="primary", use_container_width=True):
                 df = clean_ts(raw, tc, vc, val_name)
                 if df.empty:
@@ -792,12 +1005,9 @@ if page == "📥 Datenimport":
 
     st.divider()
 
-    # Forward-Kurven
     with st.container(border=True):
         st.markdown("**3️⃣ Forward-Kurven (mehrere Produkte)**")
-        st.caption(
-            "Breites Format: `Datum | Cal-25 | Q1-25 | …` — "
-            "oder langes Format: `Datum | Produkt | Preis`")
+        st.caption("Breites Format: `Datum | Cal-25 | Q1-25 | …` — oder langes: `Datum | Produkt | Preis`")
 
         if st.session_state.forward_curves is not None:
             fc = st.session_state.forward_curves
@@ -805,12 +1015,12 @@ if page == "📥 Datenimport":
             c1.success(f"✅ **{len(fc)} Produkte**: {', '.join(fc.keys())}")
             if c2.button("🗑️", key="fc_del"):
                 st.session_state.forward_curves = None
-                st.session_state.pop("fc_raw", None)
                 st.rerun()
-            for name, cv in fc.items():
-                s = cv.attrs.get("lieferstart", "?")
-                e = cv.attrs.get("lieferende", "?")
-                st.caption(f"  • {name}: {len(cv)} Tage, Ø {cv.price.mean():.2f} €/MWh, {s} → {e}")
+            for name, entry in fc.items():
+                cdf = entry["df"]
+                st.caption(f"  • {name} ({entry.get('profile', '?')}): {len(cdf)} Tage, "
+                           f"Ø {cdf.price.mean():.2f} €/MWh, "
+                           f"Lieferung {entry.get('start', '?')} → {entry.get('end', '?')}")
         else:
             tp, tf = st.tabs(["📋 Einfügen", "📁 Datei"])
             with tp:
@@ -839,11 +1049,8 @@ if page == "📥 Datenimport":
 
     st.divider()
 
-    # Deals
     with st.container(border=True):
         st.markdown("**4️⃣ Echte Deals (optional)**")
-        st.caption("Produkt, Leistung (MW), Preis (€/MWh). Lieferzeitraum wird aus Produktnamen erkannt.")
-
         if st.session_state.deals_df is not None:
             d = st.session_state.deals_df
             c1, c2 = st.columns([5, 1])
@@ -852,12 +1059,12 @@ if page == "📥 Datenimport":
                 st.session_state.deals_df = None
                 st.rerun()
             dc = [c for c in ["produkt", "kaufdatum", "lieferstart", "lieferende",
-                              "leistung_mw", "preis", "profil"] if c in d.columns]
+                              "leistung_mw", "menge_mwh", "preis", "profil"] if c in d.columns]
             st.dataframe(d[dc], use_container_width=True, hide_index=True)
         else:
             txt = st.text_area("Deals einfügen", height=150, key="d_txt",
-                               placeholder="Produkt\tKaufdatum\tLeistung_MW\tPreis\nCal-25 Base\t15.03.2024\t10\t82.50\nQ1-25 Base\t01.06.2024\t5\t85.00")
-            if st.button("🔄 Deals verarbeiten", key="d_go", type="primary",
+                               placeholder="Produkt\tLeistung_MW\tPreis\nCal-25 Base\t2\t82.50\nQ1-25 Base\t0.5\t85.00\n\nODER mit Menge:\nProdukt\tMenge_MWh\tPreis\nCal-25 Base\t17520\t82.50")
+            if st.button("🔄 Verarbeiten", key="d_go", type="primary",
                          use_container_width=True, disabled=not txt):
                 raw = parse_text(txt)
                 if raw is not None:
@@ -866,21 +1073,19 @@ if page == "📥 Datenimport":
                         st.session_state.deals_df = p
                         st.rerun()
                     else:
-                        st.error("❌ Produkt + Preis + Zeitraum nötig")
+                        st.error("❌ Produkt + Preis + Zeitraum/MW/MWh nötig")
 
-        with st.expander("🔍 Unterstützte Produktformate"):
+        with st.expander("🔍 Unterstützte Formate"):
             st.markdown("""
-| Eingabe | Zeitraum |
-|---------|----------|
-| `Cal-25` | 01.01.–31.12.2025 |
-| `Q1-25`–`Q4-25` | Quartal |
-| `H1-25`, `H2-25` | Halbjahr |
-| `Jan-25`–`Dez-25` | Monat |
-            """)
+| Produktname | Zeitraum | Leistung |
+|-------------|----------|----------|
+| `Cal-25` | 01.01.–31.12.2025 | MW oder MWh |
+| `Q1-25`–`Q4-25` | Quartal | MW oder MWh |
+| `H1-25`, `H2-25` | Halbjahr | MW oder MWh |
+| `Jan-25`–`Dez-25` | Monat | MW oder MWh |
 
-    if all(st.session_state[k] is not None for k in ("load_df", "spot_df")):
-        if st.session_state.forward_curves or st.session_state.deals_df is not None:
-            st.success("✅ Bereit → **⚙️ Strategien**")
+**Peak**: Wird im Produktnamen erkannt → liefert nur Mo-Fr 8-20 Uhr
+            """)
 
 
 # ═══════════════════════════════════════════════
@@ -896,55 +1101,46 @@ elif page == "⚙️ Strategien":
         st.markdown("##### Produkte & Skalierung")
         fc = st.session_state.forward_curves
         if fc:
-            products = st.multiselect("Produkte für Simulation", list(fc.keys()),
+            products = st.multiselect("Produkte", list(fc.keys()),
                                       default=list(fc.keys()), key="sim_prods")
             st.session_state.config["sim_products"] = products
-
-            scales_txt = st.text_input("Skalierungsfaktoren (MW)", "0.5, 1.0, 1.5, 2.0, 3.0",
-                                       key="scales_input")
+            scales_txt = st.text_input("MW-Faktoren", "0.5, 1.0, 1.5, 2.0, 3.0", key="sc_in")
             try:
                 scales = sorted({float(x.strip()) for x in scales_txt.split(",") if float(x.strip()) > 0})
             except ValueError:
                 scales = [0.5, 1.0, 2.0]
             st.session_state.config["sim_shares"] = scales
             st.caption(f"Faktoren: {', '.join(f'{s:.1f}×' for s in scales)}")
-
-            tx = st.number_input("TX [€/MWh]", 0.0, step=0.05, format="%.2f", key="tx_input")
+            tx = st.number_input("TX [€/MWh]", 0.0, step=0.05, format="%.2f", key="tx_in")
             st.session_state.config["tx_cost"] = tx
+
+            n_sc = len(scales) * 5 + len(scales)  # sim + dca
+            st.info(f"📐 Ca. **{n_sc} Simulationsszenarien** + Deals")
         else:
-            st.warning("Forward-Kurven fehlen → Datenimport")
+            st.warning("Forward-Kurven fehlen.")
 
     with tab_dca:
         st.markdown("##### Dollar Cost Averaging")
         with st.container(border=True):
             c1, c2 = st.columns(2)
             dca_w = c1.selectbox("Fenster", ["Alle Daten", "36 Monate", "24 Monate",
-                                              "18 Monate", "12 Monate", "6 Monate"],
-                                 key="dca_window")
+                                              "18 Monate", "12 Monate", "6 Monate"], key="dca_w")
             wm = {"Alle": 0, "36": 36, "24": 24, "18": 18, "12": 12, "6": 6}
             st.session_state.config["dca_window_months"] = next(
                 (v for k, v in wm.items() if k in dca_w), 0)
-            dca_f = c2.selectbox("Frequenz", ["Täglich", "Wöchentlich", "Monatlich"],
-                                 key="dca_freq_sel")
+            dca_f = c2.selectbox("Frequenz", ["Täglich", "Wöchentlich", "Monatlich"], key="dca_f")
             st.session_state.config["dca_freq"] = dca_f
 
     with tab_deals:
         st.markdown("##### Echte Deals")
         dd = st.session_state.deals_df
         if dd is not None and not dd.empty:
-            dc = [c for c in ["produkt", "leistung_mw", "preis", "profil",
-                              "lieferstart", "lieferende"] if c in dd.columns]
+            dc = [c for c in ["produkt", "leistung_mw", "menge_mwh", "preis",
+                              "profil", "lieferstart", "lieferende"] if c in dd.columns]
             st.dataframe(dd[dc], use_container_width=True, hide_index=True)
+            st.caption("Deals werden auch skaliert getestet (×0.5, ×1.5, ×2.0 …)")
         else:
             st.info("Keine Deals hinterlegt.")
-
-    if fc:
-        with st.expander("🔍 Forward-Kurven Details"):
-            for name, cv in fc.items():
-                s = cv.attrs.get("lieferstart", "?")
-                e = cv.attrs.get("lieferende", "?")
-                st.markdown(f"**{name}** · {cv.attrs.get('profil', '?')} · {s} → {e} · "
-                            f"Ø {cv.price.mean():.2f} €/MWh")
 
 
 # ═══════════════════════════════════════════════
@@ -973,35 +1169,34 @@ elif page == "🔬 Analyse":
 
     with st.container(border=True):
         if dd is not None and not dd.empty:
-            slider_val = st.slider(
-                "**Deal-Skalierung**", 0.0, 3.0, 1.0, 0.1,
-                format="%.1f×", key="interactive_slider_main",
-                help="1.0 = echte Deals, 0 = 100% Spot")
-
+            slider_val = st.slider("**Deal-Skalierung**", 0.0, 3.0, 1.0, 0.1,
+                                   format="%.1f×", key="int_slider",
+                                   help="1.0 = echte Deals, 0 = 100% Spot")
             scaled = scale_deals(dd, slider_val)
-            r = evaluate_strategy(ld, sd, scaled, f"Deals ×{slider_val:.1f}")
+            r = evaluate_strategy(ld, sd, scaled, f"Deals ×{slider_val:.1f}",
+                                  tx_cost=cfg.get("tx_cost", 0))
 
             c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Skalierung", f"{slider_val:.1f}×")
-            c2.metric("Gesamt", f"{r['total_cost']:,.0f} €",
-                      f"{r['pnl']:+,.0f} € vs Spot")
+            c2.metric("Gesamt", f"{r['total_cost']:,.0f} €", f"{r['pnl']:+,.0f} € vs Spot")
             c3.metric("Ø Preis", f"{r['avg_price']:.2f} €/MWh")
             c4.metric("Terminanteil", f"{r['termin_pct']:.1f} %")
             c5.metric("100% Spot", f"{r['total_spot_cost']:,.0f} €")
 
-            # FIX: unique key for this chart
-            st.plotly_chart(
-                fig_delivery_profile(r["merged"], f" (×{slider_val:.1f})"),
-                use_container_width=True,
-                key="chart_interactive_delivery"
-            )
+            # Warnungen anzeigen
+            for w in r.get("warnings", []):
+                st.caption(w)
+
+            st.plotly_chart(fig_delivery(r["merged"], f" (×{slider_val:.1f})"),
+                           use_container_width=True, key="ch_int_del")
 
             if not r["deal_details"].empty:
-                with st.expander("📋 Deal-Details (interaktiv)"):
-                    st.dataframe(r["deal_details"].style.format({
-                        "leistung_mw": "{:.1f}", "preis": "{:.2f}",
-                        "mwh_geliefert": "{:,.0f}", "kosten": "{:,.0f}",
-                    }), use_container_width=True, hide_index=True)
+                with st.expander("📋 Deal-Details"):
+                    fmt = {"leistung_mw": "{:.1f}", "menge_mwh": "{:,.0f}",
+                           "preis": "{:.2f}", "kosten": "{:,.0f}"}
+                    valid_fmt = {k: v for k, v in fmt.items() if k in r["deal_details"].columns}
+                    st.dataframe(r["deal_details"].style.format(valid_fmt),
+                                 use_container_width=True, hide_index=True)
         else:
             st.info("Deals hinterlegen für interaktive Bewertung.")
 
@@ -1021,6 +1216,11 @@ elif page == "🔬 Analyse":
         prog.empty()
         st.session_state.bt = bt
         st.success(f"✅ **{len(bt['results'])} Strategien** bewertet")
+
+        # Warnungen anzeigen
+        for w in bt.get("warnings", []):
+            st.warning(w) if w.startswith("⚠") else st.info(w)
+
         st.rerun()
 
     bt = st.session_state.bt
@@ -1036,17 +1236,15 @@ elif page == "🔬 Analyse":
         best = R.iloc[0]
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("🏆 Beste", best.Strategie,
-                  f"{best['PnL vs Spot [€]']:+,.0f} €")
-        c2.metric("Kosten", f"{best['Gesamt [€]']:,.0f} €",
-                  f"{best['Ersparnis [%]']:+.1f}%")
+        c1.metric("🏆 Beste", best.Strategie, f"{best['PnL vs Spot [€]']:+,.0f} €")
+        c2.metric("Kosten", f"{best['Gesamt [€]']:,.0f} €", f"{best['Ersparnis [%]']:+.1f}%")
         c3.metric("100% Spot", f"{TS:,.0f} €", f"Ø {AS:.2f} €/MWh")
         c4.metric("Bedarf", f"{TD:,.0f} MWh")
 
-        # Echte Deals hervorheben
+        # Echte Deals
         if "📝 Echte Deals" in R.Strategie.values:
             dr = R[R.Strategie == "📝 Echte Deals"].iloc[0]
-            rank = R.index[R.Strategie == "📝 Echte Deals"].tolist()[0]
+            rank = int(R.index[R.Strategie == "📝 Echte Deals"].tolist()[0])
             with st.container(border=True):
                 c1, c2, c3, c4, c5 = st.columns(5)
                 icon = "🟢" if dr["PnL vs Spot [€]"] > 0 else "🔴"
@@ -1057,84 +1255,59 @@ elif page == "🔬 Analyse":
                 c5.metric("Platz", f"{rank}", f"von {len(R)}")
 
         st.markdown("##### 🏆 Top 5")
-        st.dataframe(
-            R.head(5)[["Strategie", "Gesamt [€]", "Ø Preis [€/MWh]",
-                        "Terminanteil [%]", "PnL vs Spot [€]", "Ersparnis [%]",
-                        "Überdeckung [MWh]"]].style.format({
-                "Gesamt [€]": "{:,.0f}", "Ø Preis [€/MWh]": "{:.2f}",
-                "Terminanteil [%]": "{:.1f}", "PnL vs Spot [€]": "{:+,.0f}",
-                "Ersparnis [%]": "{:+.1f}%", "Überdeckung [MWh]": "{:,.0f}",
-            }),
-            use_container_width=True, hide_index=True,
-        )
+        display_cols = ["Strategie", "Gesamt [€]", "Ø Preis [€/MWh]", "Terminanteil [%]",
+                        "PnL vs Spot [€]", "Ersparnis [%]", "Überdeckung [MWh]"]
+        display_cols = [c for c in display_cols if c in R.columns]
+        fmt = {"Gesamt [€]": "{:,.0f}", "Ø Preis [€/MWh]": "{:.2f}",
+               "Terminanteil [%]": "{:.1f}", "PnL vs Spot [€]": "{:+,.0f}",
+               "Ersparnis [%]": "{:+.1f}%", "Überdeckung [MWh]": "{:,.0f}"}
+        valid_fmt = {k: v for k, v in fmt.items() if k in display_cols}
+        st.dataframe(R.head(5)[display_cols].style.format(valid_fmt),
+                     use_container_width=True, hide_index=True)
 
         with st.expander("📋 Alle Ergebnisse"):
             st.dataframe(R, use_container_width=True)
 
-        # Charts – ALL with unique keys
+        # Charts
         st.divider()
-        max_s = st.slider("Max. Balken", 5, len(R), min(15, len(R)), key="max_bars_slider")
+        max_s = st.slider("Max. Balken", 5, len(R), min(15, len(R)), key="ms_slider")
         show = R.head(max_s)
 
-        chart_tabs = st.tabs([
-            "💰 Kosten", "📊 Ersparnis", "📈 Kumulativ",
-            "🔵 Forward-Kurven", "📦 Lieferprofil"
-        ])
+        tabs = st.tabs(["💰 Kosten", "📊 Ersparnis", "📈 Kumulativ",
+                        "🔵 Forward", "📦 Lieferprofil"])
 
-        with chart_tabs[0]:
-            st.plotly_chart(
-                fig_costs(show, TS, " – Analyse"),
-                use_container_width=True,
-                key="chart_analyse_costs"
-            )
-
-        with chart_tabs[1]:
-            st.plotly_chart(
-                fig_savings(show, " – Analyse"),
-                use_container_width=True,
-                key="chart_analyse_savings"
-            )
-
-        with chart_tabs[2]:
+        with tabs[0]:
+            st.plotly_chart(fig_costs(show, TS, " – BT"), use_container_width=True, key="ch_bt_cost")
+        with tabs[1]:
+            st.plotly_chart(fig_savings(show, " – BT"), use_container_width=True, key="ch_bt_sav")
+        with tabs[2]:
             dk = [k for k in CUM if k.startswith("📝")]
             if not dk:
                 dk = list(CUM.keys())[:5]
-            sel = st.multiselect("Strategien wählen", list(CUM.keys()),
-                                 default=dk[:5], key="cum_select")
+            sel = st.multiselect("Strategien", list(CUM.keys()), default=dk[:5], key="cum_sel")
             if sel and merged_ref is not None:
-                st.plotly_chart(
-                    fig_cum(merged_ref, CUM, sel, " – Analyse"),
-                    use_container_width=True,
-                    key="chart_analyse_cum"
-                )
-
-        with chart_tabs[3]:
+                st.plotly_chart(fig_cum(merged_ref, CUM, sel, " – BT"),
+                               use_container_width=True, key="ch_bt_cum")
+        with tabs[3]:
             if fc:
-                st.plotly_chart(
-                    fig_forward_curves(fc, dd, " – Analyse"),
-                    use_container_width=True,
-                    key="chart_analyse_fwd"
-                )
-
-        with chart_tabs[4]:
-            avail_strats = [r_name for r_name in details]
-            if avail_strats:
-                strat_choice = st.selectbox(
-                    "Strategie wählen", avail_strats,
-                    key="delivery_profile_select"
-                )
-                if strat_choice in details:
-                    det = details[strat_choice]
-                    st.plotly_chart(
-                        fig_delivery_profile(det["merged"], f" – {strat_choice}"),
-                        use_container_width=True,
-                        key="chart_analyse_delivery"
-                    )
+                st.plotly_chart(fig_forward_curves(fc, dd, " – BT"),
+                               use_container_width=True, key="ch_bt_fwd")
+        with tabs[4]:
+            avail = list(details.keys())
+            if avail:
+                choice = st.selectbox("Strategie", avail, key="del_sel")
+                if choice in details:
+                    det = details[choice]
+                    st.plotly_chart(fig_delivery(det["merged"], f" – {choice}"),
+                                   use_container_width=True, key="ch_bt_del")
                     if not det["deal_details"].empty:
-                        st.dataframe(det["deal_details"].style.format({
-                            "leistung_mw": "{:.1f}", "preis": "{:.2f}",
-                            "mwh_geliefert": "{:,.0f}", "kosten": "{:,.0f}",
-                        }), use_container_width=True, hide_index=True)
+                        fmt_dd = {"leistung_mw": "{:.1f}", "menge_mwh": "{:,.0f}",
+                                  "preis": "{:.2f}", "kosten": "{:,.0f}"}
+                        valid_dd = {k: v for k, v in fmt_dd.items() if k in det["deal_details"].columns}
+                        st.dataframe(det["deal_details"].style.format(valid_dd),
+                                     use_container_width=True, hide_index=True)
+                    for w in det.get("warnings", []):
+                        st.caption(w)
 
 
 # ═══════════════════════════════════════════════
@@ -1160,10 +1333,8 @@ elif page == "📊 Dashboard":
     with st.container(border=True):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("🏆 Optimum", best.Strategie)
-        c2.metric("Kosten", f"{best['Gesamt [€]']:,.0f} €",
-                  f"{best['PnL vs Spot [€]']:+,.0f} €")
-        c3.metric("Schlechteste", worst.Strategie,
-                  f"{worst['PnL vs Spot [€]']:+,.0f} €")
+        c2.metric("Kosten", f"{best['Gesamt [€]']:,.0f} €", f"{best['PnL vs Spot [€]']:+,.0f} €")
+        c3.metric("Schlechteste", worst.Strategie, f"{worst['PnL vs Spot [€]']:+,.0f} €")
         c4.metric("Spanne", f"{worst['Gesamt [€]'] - best['Gesamt [€]']:,.0f} €")
 
     with st.container(border=True):
@@ -1172,7 +1343,6 @@ elif page == "📊 Dashboard":
         c2.metric("100% Spot", f"{TS:,.0f} €")
         c3.metric("Ø Spot", f"{AS:.2f} €/MWh")
 
-    # Echte Deals
     if "📝 Echte Deals" in details:
         st.divider()
         st.subheader("⭐ Bewertung Ihrer Deals")
@@ -1184,38 +1354,35 @@ elif page == "📊 Dashboard":
             c1, c2, c3, c4, c5 = st.columns(5)
             icon = "🟢" if det["pnl"] > 0 else "🔴"
             c1.metric(f"{icon} Kosten", f"{det['total_cost']:,.0f} €")
-            c2.metric("Ersparnis", f"{det['pnl']:+,.0f} €",
-                      f"{det['pct']:+.1f}%")
-            c3.metric("Terminanteil", f"{det['termin_pct']:.1f}%",
-                      f"{det['termin_vol']:,.0f} MWh")
+            c2.metric("Ersparnis", f"{det['pnl']:+,.0f} €", f"{det['pct']:+.1f}%")
+            c3.metric("Terminanteil", f"{det['termin_pct']:.1f}%")
             c4.metric("Ø Terminpreis", f"{det['avg_termin']:.2f} €/MWh")
-            c5.metric("Ranking", f"Platz {rank_pos}", f"von {len(R)}")
+            c5.metric("Platz", f"{rank_pos}", f"von {len(R)}")
 
         if det["über_vol"] > 0:
-            st.warning(
-                f"⚠️ Überdeckung: {det['über_vol']:,.0f} MWh am Spot verkauft "
-                f"(Erlös: {det['über_erlös']:,.0f} €)")
+            st.warning(f"⚠️ Überdeckung: {det['über_vol']:,.0f} MWh verkauft (Erlös: {det['über_erlös']:,.0f} €)")
+        if det.get("tx_cost", 0) > 0:
+            st.info(f"TX-Kosten: {det['tx_cost']:,.0f} €")
 
-        # FIX: unique key for dashboard delivery profile
-        st.plotly_chart(
-            fig_delivery_profile(det["merged"], " – Dashboard Deals"),
-            use_container_width=True,
-            key="chart_dashboard_delivery"
-        )
+        st.plotly_chart(fig_delivery(det["merged"], " – Deals"),
+                       use_container_width=True, key="ch_db_del")
 
         if not det["deal_details"].empty:
             st.markdown("**Deal-Details:**")
-            st.dataframe(det["deal_details"][[
-                "produkt", "lieferstart", "lieferende", "leistung_mw",
-                "preis", "profil", "perioden", "mwh_geliefert", "kosten"
-            ]].style.format({
-                "leistung_mw": "{:.1f} MW", "preis": "{:.2f} €/MWh",
-                "mwh_geliefert": "{:,.0f} MWh", "kosten": "{:,.0f} €",
-            }), use_container_width=True, hide_index=True)
+            cols_show = [c for c in ["produkt", "lieferstart", "lieferende", "leistung_mw",
+                                     "menge_mwh", "preis", "profil", "perioden", "kosten"]
+                         if c in det["deal_details"].columns]
+            fmt_d = {"leistung_mw": "{:.1f} MW", "menge_mwh": "{:,.0f} MWh",
+                     "preis": "{:.2f} €/MWh", "kosten": "{:,.0f} €"}
+            valid_d = {k: v for k, v in fmt_d.items() if k in cols_show}
+            st.dataframe(det["deal_details"][cols_show].style.format(valid_d),
+                         use_container_width=True, hide_index=True)
+
+        for w in det.get("warnings", []):
+            st.caption(w)
 
     st.divider()
 
-    # Risiko
     st.subheader("📉 Risiko")
     costs = R["Gesamt [€]"].values
     pnl = R["PnL vs Spot [€]"].values
@@ -1229,25 +1396,17 @@ elif page == "📊 Dashboard":
 
     st.divider()
 
-    # Empfehlung
     st.subheader("💡 Empfehlung")
     if best["PnL vs Spot [€]"] > 0:
         st.success(
             f"**Optimale Strategie: {best.Strategie}**\n\n"
             f"- Kosten: **{best['Gesamt [€]']:,.0f} €** (statt {TS:,.0f} €)\n"
-            f"- Ersparnis: **{best['PnL vs Spot [€]']:+,.0f} €** "
-            f"({best['Ersparnis [%]']:+.1f}%)\n"
+            f"- Ersparnis: **{best['PnL vs Spot [€]']:+,.0f} €** ({best['Ersparnis [%]']:+.1f}%)\n"
             f"- Terminanteil: **{best['Terminanteil [%]']:.1f}%**")
     else:
-        st.info(
-            f"**100% Spot wäre am günstigsten gewesen** "
-            f"({TS:,.0f} €, Ø {AS:.2f} €/MWh)")
+        st.info(f"**100% Spot wäre am günstigsten gewesen** ({TS:,.0f} €, Ø {AS:.2f} €/MWh)")
 
     st.divider()
-    st.download_button(
-        "📥 CSV Export",
-        R.to_csv(index=False, sep=";", decimal=",").encode("utf-8"),
-        "ergebnisse.csv", "text/csv",
-        use_container_width=True,
-        key="download_csv"
-    )
+    st.download_button("📥 CSV Export",
+                       R.to_csv(index=False, sep=";", decimal=",").encode("utf-8"),
+                       "ergebnisse.csv", "text/csv", use_container_width=True, key="dl_csv")
