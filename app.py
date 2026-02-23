@@ -1,4 +1,4 @@
-import streamlit as st
+app_code = r'''import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -61,6 +61,65 @@ def load_file(uploaded_file):
     except Exception as e:
         st.error(f"Fehler beim Laden: {e}")
     return None
+
+
+def parse_pasted_text(text):
+    """Parst eingefügten Text (Copy-Paste) mit Auto-Erkennung des Trennzeichens."""
+    if not text or not text.strip():
+        return None
+    text = text.strip()
+    for sep in ['\t', ';', ',', '|']:
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=sep, engine='python')
+            if len(df.columns) >= 2 and len(df) > 0:
+                return df
+        except:
+            continue
+    # Letzter Versuch: Whitespace
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=r'\s+', engine='python')
+        if len(df.columns) >= 2:
+            return df
+    except:
+        pass
+    return None
+
+
+def data_input_block(label, file_key, paste_key):
+    """Wiederverwendbarer Datenimport-Block mit Upload + Copy-Paste."""
+    input_method = st.radio(
+        f"Eingabemethode für {label}",
+        ["📁 Datei hochladen", "📋 Copy & Paste"],
+        horizontal=True,
+        key=f"method_{file_key}"
+    )
+
+    raw = None
+
+    if input_method == "📁 Datei hochladen":
+        uploaded = st.file_uploader(
+            f"{label} hochladen (CSV, XLSX)",
+            type=['csv', 'xlsx', 'xls'],
+            key=file_key
+        )
+        if uploaded:
+            raw = load_file(uploaded)
+
+    else:  # Copy & Paste
+        st.caption("Daten direkt einfügen – z.B. aus Excel kopiert (Tab-getrennt), CSV (Semikolon/Komma) etc.")
+        pasted = st.text_area(
+            f"Daten hier einfügen ({label})",
+            height=200,
+            key=paste_key,
+            placeholder="Datum;Wert\n01.01.2025;42.5\n02.01.2025;38.2\n..."
+        )
+        if pasted and pasted.strip():
+            raw = parse_pasted_text(pasted)
+            if raw is None and pasted.strip():
+                st.error("❌ Text konnte nicht als Tabelle erkannt werden. "
+                         "Unterstützte Formate: Tab-getrennt, Semikolon, Komma, Pipe.")
+
+    return raw
 
 
 def detect_datetime_col(df):
@@ -149,29 +208,27 @@ if page == "📥 Datenimport":
     # ── 1. Lastprofil ──
     st.subheader("1️⃣ Lastprofil (Lieferperiode)")
     st.caption("Zeitreihe Ihres Stromverbrauchs in MWh – z.B. stündlich oder täglich")
-    load_up = st.file_uploader("Lastprofil hochladen", type=['csv', 'xlsx', 'xls'], key='load_up')
+    raw = data_input_block("Lastprofil", "load_up", "load_paste")
 
-    if load_up:
-        raw = load_file(load_up)
-        if raw is not None:
-            with st.expander("Vorschau Rohdaten", expanded=True):
-                st.dataframe(raw.head(10), use_container_width=True)
+    if raw is not None:
+        with st.expander("Vorschau Rohdaten", expanded=True):
+            st.dataframe(raw.head(10), use_container_width=True)
 
-            cols = list(raw.columns)
-            auto_t = detect_datetime_col(raw)
-            auto_v = detect_numeric_col(raw, [auto_t] if auto_t else [])
+        cols = list(raw.columns)
+        auto_t = detect_datetime_col(raw)
+        auto_v = detect_numeric_col(raw, [auto_t] if auto_t else [])
 
-            c1, c2 = st.columns(2)
-            tc = c1.selectbox("Zeitspalte", cols, index=cols.index(auto_t) if auto_t and auto_t in cols else 0, key='ltc')
-            vc = c2.selectbox("Verbrauch [MWh]", cols, index=cols.index(auto_v) if auto_v and auto_v in cols else min(1, len(cols)-1), key='lvc')
+        c1, c2 = st.columns(2)
+        tc = c1.selectbox("Zeitspalte", cols, index=cols.index(auto_t) if auto_t and auto_t in cols else 0, key='ltc')
+        vc = c2.selectbox("Verbrauch [MWh]", cols, index=cols.index(auto_v) if auto_v and auto_v in cols else min(1, len(cols)-1), key='lvc')
 
-            if st.button("✅ Lastprofil übernehmen", key='lb'):
-                df = parse_and_clean(raw, tc, vc, 'load_mwh')
-                if len(df) > 0:
-                    st.session_state.load_df = df
-                    st.success(f"Lastprofil geladen: {len(df)} Einträge, {df['datetime'].min().date()} bis {df['datetime'].max().date()}, Gesamt: {df['load_mwh'].sum():,.1f} MWh")
-                else:
-                    st.error("Keine gültigen Daten nach Parsing.")
+        if st.button("✅ Lastprofil übernehmen", key='lb'):
+            df = parse_and_clean(raw, tc, vc, 'load_mwh')
+            if len(df) > 0:
+                st.session_state.load_df = df
+                st.success(f"Lastprofil geladen: {len(df)} Einträge, {df['datetime'].min().date()} bis {df['datetime'].max().date()}, Gesamt: {df['load_mwh'].sum():,.1f} MWh")
+            else:
+                st.error("Keine gültigen Daten nach Parsing.")
 
     if st.session_state.load_df is not None:
         d = st.session_state.load_df
@@ -182,29 +239,27 @@ if page == "📥 Datenimport":
     # ── 2. Spotpreise ──
     st.subheader("2️⃣ Spotpreise (während Lieferperiode)")
     st.caption("Historische Day-Ahead / Spotpreise in €/MWh – gleicher Zeitraum wie das Lastprofil")
-    spot_up = st.file_uploader("Spotpreise hochladen", type=['csv', 'xlsx', 'xls'], key='spot_up')
+    raw = data_input_block("Spotpreise", "spot_up", "spot_paste")
 
-    if spot_up:
-        raw = load_file(spot_up)
-        if raw is not None:
-            with st.expander("Vorschau Rohdaten", expanded=True):
-                st.dataframe(raw.head(10), use_container_width=True)
+    if raw is not None:
+        with st.expander("Vorschau Rohdaten", expanded=True):
+            st.dataframe(raw.head(10), use_container_width=True)
 
-            cols = list(raw.columns)
-            auto_t = detect_datetime_col(raw)
-            auto_v = detect_numeric_col(raw, [auto_t] if auto_t else [])
+        cols = list(raw.columns)
+        auto_t = detect_datetime_col(raw)
+        auto_v = detect_numeric_col(raw, [auto_t] if auto_t else [])
 
-            c1, c2 = st.columns(2)
-            tc = c1.selectbox("Zeitspalte", cols, index=cols.index(auto_t) if auto_t and auto_t in cols else 0, key='stc')
-            vc = c2.selectbox("Preis [€/MWh]", cols, index=cols.index(auto_v) if auto_v and auto_v in cols else min(1, len(cols)-1), key='svc')
+        c1, c2 = st.columns(2)
+        tc = c1.selectbox("Zeitspalte", cols, index=cols.index(auto_t) if auto_t and auto_t in cols else 0, key='stc')
+        vc = c2.selectbox("Preis [€/MWh]", cols, index=cols.index(auto_v) if auto_v and auto_v in cols else min(1, len(cols)-1), key='svc')
 
-            if st.button("✅ Spotpreise übernehmen", key='sb'):
-                df = parse_and_clean(raw, tc, vc, 'spot_price')
-                if len(df) > 0:
-                    st.session_state.spot_df = df
-                    st.success(f"Spotpreise geladen: {len(df)} Einträge, Ø {df['spot_price'].mean():.2f} €/MWh")
-                else:
-                    st.error("Keine gültigen Daten nach Parsing.")
+        if st.button("✅ Spotpreise übernehmen", key='sb'):
+            df = parse_and_clean(raw, tc, vc, 'spot_price')
+            if len(df) > 0:
+                st.session_state.spot_df = df
+                st.success(f"Spotpreise geladen: {len(df)} Einträge, Ø {df['spot_price'].mean():.2f} €/MWh")
+            else:
+                st.error("Keine gültigen Daten nach Parsing.")
 
     if st.session_state.spot_df is not None:
         d = st.session_state.spot_df
@@ -215,29 +270,27 @@ if page == "📥 Datenimport":
     # ── 3. Terminmarktpreise ──
     st.subheader("3️⃣ Terminmarktpreise (VOR Lieferperiode)")
     st.caption("Forward-/Terminpreise für das Lieferprodukt, beobachtet VOR Lieferbeginn – z.B. tägliche Cal-25 Baseload-Preise im Jahr 2024")
-    fwd_up = st.file_uploader("Terminmarktpreise hochladen", type=['csv', 'xlsx', 'xls'], key='fwd_up')
+    raw = data_input_block("Terminmarktpreise", "fwd_up", "fwd_paste")
 
-    if fwd_up:
-        raw = load_file(fwd_up)
-        if raw is not None:
-            with st.expander("Vorschau Rohdaten", expanded=True):
-                st.dataframe(raw.head(10), use_container_width=True)
+    if raw is not None:
+        with st.expander("Vorschau Rohdaten", expanded=True):
+            st.dataframe(raw.head(10), use_container_width=True)
 
-            cols = list(raw.columns)
-            auto_t = detect_datetime_col(raw)
-            auto_v = detect_numeric_col(raw, [auto_t] if auto_t else [])
+        cols = list(raw.columns)
+        auto_t = detect_datetime_col(raw)
+        auto_v = detect_numeric_col(raw, [auto_t] if auto_t else [])
 
-            c1, c2 = st.columns(2)
-            tc = c1.selectbox("Zeitspalte", cols, index=cols.index(auto_t) if auto_t and auto_t in cols else 0, key='ftc')
-            vc = c2.selectbox("Preis [€/MWh]", cols, index=cols.index(auto_v) if auto_v and auto_v in cols else min(1, len(cols)-1), key='fvc')
+        c1, c2 = st.columns(2)
+        tc = c1.selectbox("Zeitspalte", cols, index=cols.index(auto_t) if auto_t and auto_t in cols else 0, key='ftc')
+        vc = c2.selectbox("Preis [€/MWh]", cols, index=cols.index(auto_v) if auto_v and auto_v in cols else min(1, len(cols)-1), key='fvc')
 
-            if st.button("✅ Terminmarktpreise übernehmen", key='fb'):
-                df = parse_and_clean(raw, tc, vc, 'forward_price')
-                if len(df) > 0:
-                    st.session_state.forward_df = df
-                    st.success(f"Terminmarktpreise geladen: {len(df)} Einträge, Ø {df['forward_price'].mean():.2f} €/MWh")
-                else:
-                    st.error("Keine gültigen Daten nach Parsing.")
+        if st.button("✅ Terminmarktpreise übernehmen", key='fb'):
+            df = parse_and_clean(raw, tc, vc, 'forward_price')
+            if len(df) > 0:
+                st.session_state.forward_df = df
+                st.success(f"Terminmarktpreise geladen: {len(df)} Einträge, Ø {df['forward_price'].mean():.2f} €/MWh")
+            else:
+                st.error("Keine gültigen Daten nach Parsing.")
 
     if st.session_state.forward_df is not None:
         d = st.session_state.forward_df
@@ -883,3 +936,92 @@ elif page == "📊 Dashboard":
         "backtesting_ergebnisse.csv",
         "text/csv"
     )
+'''
+
+with open('app.py', 'w', encoding='utf-8') as f:
+    f.write(app_code)
+
+req = """streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+plotly>=5.18.0
+openpyxl>=3.1.0
+"""
+with open('requirements.txt', 'w') as f:
+    f.write(req)
+
+print(f"app.py: {len(app_code)} Zeichen")
+print(f"requirements.txt geschrieben")app_code = r'''import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import io
+
+st.set_page_config(
+    page_title="Energiebeschaffung Simulation & Backtesting",
+    layout="wide",
+    page_icon="⚡"
+)
+
+# ── Styling ──
+st.markdown("""
+<style>
+    .stMetric { background: #1e1e2e; padding: 15px; border-radius: 10px; border-left: 4px solid #4CAF50; }
+    div[data-testid="stMetricValue"] { font-size: 1.3rem; }
+    .big-number { font-size: 2rem; font-weight: bold; color: #4CAF50; }
+    .info-box { background: #262640; padding: 15px; border-radius: 8px; margin: 10px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+# ── Session State ──
+defaults = {
+    'load_df': None, 'spot_df': None, 'forward_df': None,
+    'bt_results': None, 'bt_merged': None, 'bt_spot_total': None,
+    'bt_demand_total': None, 'bt_avg_spot': None,
+    'strategy_config': {
+        'forward_shares': [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        'patterns': ['Gleichmäßig'],
+        'n_tranches': 6,
+        'tx_cost': 0.0
+    }
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ── Helper Functions ──
+def load_file(uploaded_file):
+    if uploaded_file is None:
+        return None
+    name = uploaded_file.name.lower()
+    try:
+        if name.endswith('.csv'):
+            raw = uploaded_file.read()
+            uploaded_file.seek(0)
+            text = raw.decode('utf-8', errors='replace')
+            for sep in [';', ',', '\t', '|']:
+                try:
+                    df = pd.read_csv(io.StringIO(text), sep=sep)
+                    if len(df.columns) >= 2:
+                        return df
+                except:
+                    continue
+            return pd.read_csv(io.StringIO(text))
+        elif name.endswith(('.xlsx', '.xls')):
+            return pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"Fehler beim Laden: {e}")
+    return None
+
+
+def parse_pasted_text(text):
+    """Parst eingefügten Text (Copy-Paste) mit Auto-Erkennung des Trennzeichens."""
+    if not text or not text.strip():
+        return None
+    text = text.strip()
+    for sep in ['\t', ';', ',', '|']:
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=sep, engine='python')
+            if len(df.colum
